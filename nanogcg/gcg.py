@@ -1,10 +1,12 @@
 import copy
 import gc
 import logging
-
-from dataclasses import dataclass
+import json
+from datetime import datetime
+from dataclasses import dataclass, asdict
 from tqdm import tqdm
 from typing import List, Optional, Union
+from typeguard import check_type
 
 import torch
 import transformers
@@ -192,8 +194,8 @@ class GCG:
     
     def run(
         self,
-        messages: Union[str, List[dict]],
-        target: str,
+        messages: List[Union[str, List[dict]]],
+        targets: List[str],
     ) -> GCGResult:
         model = self.model
         tokenizer = self.tokenizer
@@ -202,28 +204,36 @@ class GCG:
         if config.seed is not None:
             set_seed(config.seed)
             torch.use_deterministic_algorithms(True, warn_only=True)
-    
-        if isinstance(messages, str):
-            messages = [{"role": "user", "content": messages}]
+
+        if check_type(messages, List[str]):
+            messages = [[{"role": "user", "content": message}] for message in messages]
         else:
             messages = copy.deepcopy(messages)
     
         # Append the GCG string at the end of the prompt if location not specified
-        if not any(["{optim_str}" in d["content"] for d in messages]):
-            messages[-1]["content"] = messages[-1]["content"] + "{optim_str}"
+        # TODO: Update to work with batch, not necessary for now
+        # if not any(["{optim_str}" in d["content"] for d in messages]):
+        #     messages[-1]["content"] = messages[-1]["content"] + "{optim_str}"
 
-        template = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True) 
+        templates = [tokenizer.apply_chat_template(message, tokenize=False, add_generation_prompt=True) for message in messages]
         # Remove the BOS token -- this will get added when tokenizing, if necessary
-        if tokenizer.bos_token and template.startswith(tokenizer.bos_token):
-            template = template.replace(tokenizer.bos_token, "")
-        before_str, after_str = template.split("{optim_str}")
+        def bos_filter(template):
+            if tokenizer.bos_token and template.startswith(tokenizer.bos_token):
+                return template.replace(tokenizer.bos_token, "")
+            
+            return template
 
-        target = " " + target if config.add_space_before_target else target
+        templates = list(map(bos_filter, templates))
+
+        before_strs = [template.split("{optim_str}")[0] for template in templates]
+        after_strs = [template.split("{optim_str}")[1] for template in templates]
+
+        targets = [" " + target if config.add_space_before_target else target for target in targets]
 
         # Tokenize everything that doesn't get optimized
-        before_ids = tokenizer([before_str], padding=False, return_tensors="pt")["input_ids"].to(model.device).to(torch.int64)
-        after_ids = tokenizer([after_str], add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device).to(torch.int64)
-        target_ids = tokenizer([target], add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device).to(torch.int64)
+        before_ids = tokenizer(before_strs, padding=False, return_tensors="pt")["input_ids"].to(model.device).to(torch.int64)
+        after_ids = tokenizer(after_strs, padding=True, add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device).to(torch.int64)
+        target_ids = tokenizer(targets, padding=True, add_special_tokens=False, return_tensors="pt")["input_ids"].to(model.device).to(torch.int64)
 
         # Embed everything that doesn't get optimized
         embedding_layer = self.embedding_layer
@@ -270,19 +280,22 @@ class GCG:
 
                 # Compute loss on all candidate sequences 
                 batch_size = new_search_width if config.batch_size is None else config.batch_size
+
+                dataset_size = self.after_embeds.shape[0]
                 if self.prefix_cache:
                     input_embeds = torch.cat([
-                        embedding_layer(sampled_ids),
-                        after_embeds.repeat(new_search_width, 1, 1),
-                        target_embeds.repeat(new_search_width, 1, 1),
-                    ], dim=1)
+                        embedding_layer(sampled_ids).unsqueeze(1).repeat(1, dataset_size, 1, 1),
+                        after_embeds.repeat(new_search_width, 1, 1, 1),
+                        target_embeds.repeat(new_search_width, 1, 1, 1),
+                    ], dim=2)
                 else:
                     input_embeds = torch.cat([
-                        before_embeds.repeat(new_search_width, 1, 1),
-                        embedding_layer(sampled_ids),
-                        after_embeds.repeat(new_search_width, 1, 1),
-                        target_embeds.repeat(new_search_width, 1, 1),
-                    ], dim=1)
+                        before_embeds.repeat(new_search_width, 1, 1, 1),
+                        embedding_layer(sampled_ids).unsqueeze(1).repeat(1, dataset_size, 1, 1),
+                        after_embeds.repeat(new_search_width, 1, 1, 1),
+                        target_embeds.repeat(new_search_width, 1, 1, 1),
+                    ], dim=2)
+
                 loss = find_executable_batch_size(self.compute_candidates_loss, batch_size)(input_embeds)
 
                 current_loss = loss.min().item()
@@ -344,19 +357,21 @@ class GCG:
         true_buffer_size = max(1, config.buffer_size) 
 
         # Compute the loss on the initial buffer entries
+        dataset_size = self.after_embeds.shape[0]
+
         if self.prefix_cache:
             init_buffer_embeds = torch.cat([
-                self.embedding_layer(init_buffer_ids),
-                self.after_embeds.repeat(true_buffer_size, 1, 1),
-                self.target_embeds.repeat(true_buffer_size, 1, 1),
-            ], dim=1)
+                self.embedding_layer(init_buffer_ids).unsqueeze(1).repeat(1, dataset_size, 1, 1),
+                self.after_embeds.repeat(true_buffer_size, 1, 1, 1),
+                self.target_embeds.repeat(true_buffer_size, 1, 1, 1),
+            ], dim=2)
         else:
             init_buffer_embeds = torch.cat([
-                self.before_embeds.repeat(true_buffer_size, 1, 1),
-                self.embedding_layer(init_buffer_ids),
-                self.after_embeds.repeat(true_buffer_size, 1, 1),
-                self.target_embeds.repeat(true_buffer_size, 1, 1),
-            ], dim=1)
+                self.before_embeds.repeat(true_buffer_size, 1, 1, 1),
+                self.embedding_layer(init_buffer_ids).unsqueeze(1).repeat(1, dataset_size, 1, 1),
+                self.after_embeds.repeat(true_buffer_size, 1, 1, 1),
+                self.target_embeds.repeat(true_buffer_size, 1, 1, 1),
+            ], dim=2)
 
         init_buffer_losses = find_executable_batch_size(self.compute_candidates_loss, true_buffer_size)(init_buffer_embeds)
 
@@ -390,28 +405,38 @@ class GCG:
 
         # (1, num_optim_tokens, vocab_size) @ (vocab_size, embed_dim) -> (1, num_optim_tokens, embed_dim)
         optim_embeds = optim_ids_onehot @ embedding_layer.weight
+        loss_list = []
+        for i in range(self.after_embeds.shape[0]):
+            after_embeds_slice = self.after_embeds[i:i+1,:,:]
+            before_embeds_slice = self.before_embeds[i:i+1,:,:]
+            target_embeds_slice = self.target_embeds[i:i+1,:,:]
 
-        if self.prefix_cache:
-            input_embeds = torch.cat([optim_embeds, self.after_embeds, self.target_embeds], dim=1)
-            output = model(inputs_embeds=input_embeds, past_key_values=self.prefix_cache)
-        else:
-            input_embeds = torch.cat([self.before_embeds, optim_embeds, self.after_embeds, self.target_embeds], dim=1)
-            output = model(inputs_embeds=input_embeds)
+            if self.prefix_cache:
+                prefix_cache_split = [[x[i:i+1] for x in self.prefix_cache[j]] for j in range(len(self.prefix_cache))]
+                input_embeds = torch.cat([optim_embeds, after_embeds_slice, target_embeds_slice], dim=1)
 
-        logits = output.logits
+                output = model(inputs_embeds=input_embeds, past_key_values=prefix_cache_split)
+            else:
+                input_embeds = torch.cat([before_embeds_slice, optim_embeds, after_embeds_slice, target_embeds_slice], dim=1)
+                output = model(inputs_embeds=input_embeds)
 
-        # Shift logits so token n-1 predicts token n
-        shift = input_embeds.shape[1] - self.target_ids.shape[1]
-        shift_logits = logits[..., shift-1:-1, :].contiguous() # (1, num_target_ids, vocab_size)
-        shift_labels = self.target_ids
+            logits = output.logits
 
-        if self.config.use_mellowmax:
-            label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
-            loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
-        else:
-            loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            # Shift logits so token n-1 predicts token n
+            shift = input_embeds.shape[1] - self.target_ids[i:i+1,:].shape[1]
+            shift_logits = logits[..., shift-1:-1, :].contiguous() # (1, num_target_ids, vocab_size)
+            shift_labels = self.target_ids[i:i+1,:]
 
-        optim_ids_onehot_grad = torch.autograd.grad(outputs=[loss], inputs=[optim_ids_onehot])[0]
+            if self.config.use_mellowmax:
+                label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
+                loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
+            else:
+                loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+
+            loss_list.append(loss)
+
+        mean_loss = torch.mean(torch.stack(loss_list), dim=0)
+        optim_ids_onehot_grad = torch.autograd.grad(outputs=[mean_loss], inputs=[optim_ids_onehot])[0]
 
         return optim_ids_onehot_grad
     
@@ -433,39 +458,43 @@ class GCG:
 
         for i in range(0, input_embeds.shape[0], search_batch_size):
             with torch.no_grad():
-                input_embeds_batch = input_embeds[i:i+search_batch_size]
-                current_batch_size = input_embeds_batch.shape[0]
+                loss_list = []
+                for j in range(input_embeds.shape[1]):
+                    input_embeds_batch = input_embeds[i:i+search_batch_size, j, :, :]
+                    current_batch_size = input_embeds_batch.shape[0]
 
-                if self.prefix_cache:
-                    if not prefix_cache_batch or current_batch_size != search_batch_size:
-                        prefix_cache_batch = [[x.expand(current_batch_size, -1, -1, -1) for x in self.prefix_cache[i]] for i in range(len(self.prefix_cache))]
+                    if self.prefix_cache:
+                        if not prefix_cache_batch or current_batch_size != search_batch_size:
+                            prefix_cache_batch = [[x[j].expand(current_batch_size, -1, -1, -1) for x in self.prefix_cache[i]] for i in range(len(self.prefix_cache))]
+       
+                        outputs = self.model(inputs_embeds=input_embeds_batch, past_key_values=prefix_cache_batch)
+                    else:
+                        outputs = self.model(inputs_embeds=input_embeds_batch)
 
-                    outputs = self.model(inputs_embeds=input_embeds_batch, past_key_values=prefix_cache_batch)
-                else:
-                    outputs = self.model(inputs_embeds=input_embeds_batch)
+                    logits = outputs.logits
 
-                logits = outputs.logits
+                    tmp = input_embeds[:,j,:,:].shape[1] - self.target_ids.shape[1]
+                    shift_logits = logits[..., tmp-1:-1, :].contiguous()
+                    shift_labels = self.target_ids[j:j+1,:].repeat(current_batch_size, 1)
+                    if self.config.use_mellowmax:
+                        label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
+                        loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
+                    else:
+                        loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), reduction="none")
 
-                tmp = input_embeds.shape[1] - self.target_ids.shape[1]
-                shift_logits = logits[..., tmp-1:-1, :].contiguous()
-                shift_labels = self.target_ids.repeat(current_batch_size, 1)
-                
-                if self.config.use_mellowmax:
-                    label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
-                    loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
-                else:
-                    loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), reduction="none")
+                    
+                    loss = loss.view(current_batch_size, -1).mean(dim=-1)
+                    loss_list.append(loss)
 
-                loss = loss.view(current_batch_size, -1).mean(dim=-1)
-                all_loss.append(loss)
+                    if self.config.early_stop:
+                        if torch.any(torch.all(torch.argmax(shift_logits, dim=-1) == shift_labels, dim=-1)).item():
+                            self.stop_flag = True
 
-                if self.config.early_stop:
-                    if torch.any(torch.all(torch.argmax(shift_logits, dim=-1) == shift_labels, dim=-1)).item():
-                        self.stop_flag = True
-
-                del outputs
-                gc.collect()
-                torch.cuda.empty_cache()
+                    del outputs
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                mean_loss = torch.mean(torch.stack(loss_list), dim=0)
+                all_loss.append(mean_loss)
 
         return torch.cat(all_loss, dim=0)
 
